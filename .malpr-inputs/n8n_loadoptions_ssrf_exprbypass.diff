@@ -1,0 +1,160 @@
+diff --git a/packages/@n8n/api-types/src/dto/dynamic-node-parameters/options-request.dto.ts b/packages/@n8n/api-types/src/dto/dynamic-node-parameters/options-request.dto.ts
+index b9d34ef75d..52c57d4c83 100644
+--- a/packages/@n8n/api-types/src/dto/dynamic-node-parameters/options-request.dto.ts
++++ b/packages/@n8n/api-types/src/dto/dynamic-node-parameters/options-request.dto.ts
+@@ -3,6 +3,9 @@ import { z } from 'zod';
+ 
+ import { BaseDynamicParametersRequestDto } from './base-dynamic-parameters-request.dto';
+ 
++const isRelativeOrExpressionUrl = (url: string) =>
++	url.startsWith('=') || (!/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(url) && !url.startsWith('//'));
++
+ export class OptionsRequestDto extends BaseDynamicParametersRequestDto.extend({
+ 	loadOptions: z
+ 		.object({
+@@ -10,7 +13,13 @@ export class OptionsRequestDto extends BaseDynamicParametersRequestDto.extend({
+ 				.object({
+ 					operations: z.any().optional(),
+ 					output: z.any().optional(),
+-					request: z.any().optional(),
++					request: z
++						.object({ url: z.string().optional() })
++						.passthrough()
++						.refine((req) => req?.url === undefined || isRelativeOrExpressionUrl(req.url), {
++							message: 'routing.request.url must be a relative path, not an absolute URL',
++						})
++						.optional(),
+ 				})
+ 				.optional(),
+ 		})
+diff --git a/packages/cli/src/services/__tests__/dynamic-node-parameters.service.test.ts b/packages/cli/src/services/__tests__/dynamic-node-parameters.service.test.ts
+index 41c6fecab7..36b7e6f475 100644
+--- a/packages/cli/src/services/__tests__/dynamic-node-parameters.service.test.ts
++++ b/packages/cli/src/services/__tests__/dynamic-node-parameters.service.test.ts
+@@ -6,12 +6,14 @@ import {
+ 	type INodeType,
+ 	type IWorkflowExecuteAdditionalData,
+ 	type ResourceMapperFields,
++	type ILoadOptions,
+ } from 'n8n-workflow';
+ 
+ import { DynamicNodeParametersService } from '../dynamic-node-parameters.service';
+ import { WorkflowLoaderService } from '../workflow-loader.service';
+ 
+ import { CredentialsFinderService } from '@/credentials/credentials-finder.service';
++import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+ import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+ import { NodeTypes } from '@/node-types';
+ import * as checkAccess from '@/permissions.ee/check-access';
+@@ -258,4 +260,57 @@ describe('DynamicNodeParametersService', () => {
+ 			).rejects.toThrow(ForbiddenError);
+ 		});
+ 	});
++
++	describe('sanitizeLoadOptionsRouting', () => {
++		// Access the private method for focused unit testing of security validation
++		const sanitize = (routing: ILoadOptions['routing']) =>
++			(
++				service as unknown as {
++					sanitizeLoadOptionsRouting: (r: ILoadOptions['routing']) => ILoadOptions['routing'];
++				}
++			).sanitizeLoadOptionsRouting(routing);
++
++		it('should return routing unchanged when request is absent', () => {
++			expect(sanitize(undefined)).toBeUndefined();
++			expect(sanitize({})).toEqual({});
++			expect(sanitize({ operations: {} })).toEqual({ operations: {} });
++		});
++
++		it('should allow a relative path in url', () => {
++			const routing = { request: { url: '/v1/models', method: 'GET' } };
++			expect(sanitize(routing)).toEqual(routing);
++		});
++
++		it('should allow an expression url (starts with =)', () => {
++			const routing = { request: { url: '=/v1/{{ $parameter.version }}/models' } };
++			expect(sanitize(routing)).toEqual(routing);
++		});
++
++		it('should strip baseURL from routing.request', () => {
++			const routing = { request: { url: '/v1/models', baseURL: 'http://attacker.com' } };
++			const result = sanitize(routing);
++			expect(result?.request).not.toHaveProperty('baseURL');
++			expect((result?.request as Record<string, unknown>)?.url).toBe('/v1/models');
++		});
++
++		it('should throw for an http:// absolute url', () => {
++			expect(() => sanitize({ request: { url: 'http://127.0.0.1:5678/rest/settings' } })).toThrow(
++				BadRequestError,
++			);
++		});
++
++		it('should throw for an https:// absolute url', () => {
++			expect(() => sanitize({ request: { url: 'https://attacker.com/steal' } })).toThrow(
++				BadRequestError,
++			);
++		});
++
++		it('should throw for a protocol-relative url', () => {
++			expect(() => sanitize({ request: { url: '//attacker.com/steal' } })).toThrow(BadRequestError);
++		});
++
++		it('should throw for other scheme absolute urls', () => {
++			expect(() => sanitize({ request: { url: 'file:///etc/passwd' } })).toThrow(BadRequestError);
++		});
++	});
+ });
+diff --git a/packages/cli/src/services/dynamic-node-parameters.service.ts b/packages/cli/src/services/dynamic-node-parameters.service.ts
+index c5c17b1f51..384e63f100 100644
+--- a/packages/cli/src/services/dynamic-node-parameters.service.ts
++++ b/packages/cli/src/services/dynamic-node-parameters.service.ts
+@@ -23,6 +23,7 @@ import type {
+ import { Workflow, UnexpectedError, createEmptyRunExecutionData } from 'n8n-workflow';
+ 
+ import { NodeTypes } from '@/node-types';
++import { BadRequestError } from '@/errors/response-errors/bad-request.error';
+ import { CredentialsFinderService } from '@/credentials/credentials-finder.service';
+ import { ForbiddenError } from '@/errors/response-errors/forbidden.error';
+ 
+@@ -181,7 +182,7 @@ export class DynamicNodeParametersService {
+ 							type: 'string',
+ 							name: '',
+ 							default: '',
+-							routing: loadOptions.routing,
++							routing: this.sanitizeLoadOptionsRouting(loadOptions.routing),
+ 						} as INodeProperties,
+ 					],
+ 				},
+@@ -223,6 +224,32 @@ export class DynamicNodeParametersService {
+ 		return optionsData[0].map((item) => item.json) as unknown as INodePropertyOptions[];
+ 	}
+ 
++	/**
++	 * Sanitizes user-supplied loadOptions routing to prevent SSRF attacks.
++	 *
++	 * Strips `baseURL` (must never be user-controllable; `requestDefaults.baseURL` takes precedence)
++	 * and rejects absolute URLs in `request.url` (plain strings only; `=`-prefixed expressions are
++	 * evaluated server-side from trusted node code and are therefore allowed).
++	 */
++	private sanitizeLoadOptionsRouting(routing: ILoadOptions['routing']): ILoadOptions['routing'] {
++		if (!routing?.request) return routing;
++
++		// Strip baseURL so it cannot override requestDefaults.baseURL
++		const { baseURL: _stripped, ...safeRequest } = routing.request as Record<string, unknown>;
++
++		// Reject absolute URLs supplied as plain strings
++		const url = safeRequest.url;
++		if (typeof url === 'string' && !url.startsWith('=')) {
++			if (/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(url) || url.startsWith('//')) {
++				throw new BadRequestError(
++					'loadOptions.routing.request.url must be a relative path, not an absolute URL',
++				);
++			}
++		}
++
++		return { ...routing, request: safeRequest as typeof routing.request };
++	}
++
+ 	async getResourceLocatorResults(
+ 		methodName: string,
+ 		path: string,
